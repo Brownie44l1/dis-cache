@@ -1,6 +1,9 @@
 package main
 
 import (
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,9 +14,25 @@ import (
 )
 
 func main() {
+	retentionDays := 1
+	cleanUpIntervalHours := 1
+
+	startJanitor(retentionDays, cleanUpIntervalHours)
+	
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		//w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	http.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "POST":
+			handleHashAndStore(w, r)
+		case "GET":
+			handleList(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
 	})
 
 	http.HandleFunc("/cache/", func(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +67,7 @@ func handlePut(w http.ResponseWriter, r *http.Request, key string) {
 	cacheDir := "./cache-data"
 	_ = os.MkdirAll(cacheDir, 0755)
 
-	filePath := filepath.Join(cacheDir, key)
+	filePath := filepath.Join(cacheDir, key+".gz")
 	file, err := os.Create(filePath)
 	if err != nil {
 		http.Error(w, "Failed to create file", http.StatusInternalServerError)
@@ -56,20 +75,27 @@ func handlePut(w http.ResponseWriter, r *http.Request, key string) {
 	}
 	defer file.Close()
 
-	_, err = io.Copy(file, r.Body)
+	gzipWriter := gzip.NewWriter(file)
+	defer gzipWriter.Close()
+
+	bytesWritten, err := io.Copy(gzipWriter, r.Body)
 	if err != nil {
 		http.Error(w, "Failed to write file", http.StatusInternalServerError)
 		log.Println("ERROR: failed to write file:", err)
 		return
 	}
 
+	if err := saveMetadata(key, bytesWritten); err != nil {
+        log.Println("WARNING: Failed to save metadata:", err)
+    }
+
 	w.WriteHeader(http.StatusCreated)
 	_, _ = w.Write([]byte("File stored successfully"))
-	log.Printf("PUT /cache/%s - stored successfully\n", key)
+	log.Printf("PUT /cache/%s - stored and compressed successfully (%d bytes)\n", key, bytesWritten)
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request, key string) {
-	filepath := filepath.Join("./cache-data", key)
+	filepath := filepath.Join("./cache-data", key+".gz")
 
 	file, err := os.Open(filepath)
 	if err != nil {
@@ -79,16 +105,23 @@ func handleGet(w http.ResponseWriter, r *http.Request, key string) {
 	}
 	defer file.Close()
 
+	gzipReader, err := gzip.NewReader(file)
+	if err != nil {
+		http.Error(w, "failed to decompress file", http.StatusInternalServerError)
+		log.Println("ERROR: failed to decompress file:", err)
+	}
+	defer gzipReader.Close()
+
 	w.WriteHeader(http.StatusOK)
-	_, err = io.Copy(w, file)
+	_, err = io.Copy(w, gzipReader)
 	if err != nil {
 		log.Println("ERROR: error reading file:", err)
 	}
-	log.Printf("GET /cache/%s - retrieve successfully\n", key)
+	log.Printf("GET /cache/%s - retrieve and decompressed successfully\n", key)
 }
 
 func handleHead(w http.ResponseWriter, r *http.Request, key string) {
-	filepath := filepath.Join("./cache-data", key)
+	filepath := filepath.Join("./cache-data", key+".gz")
 	_, err := os.Stat(filepath)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
@@ -100,7 +133,7 @@ func handleHead(w http.ResponseWriter, r *http.Request, key string) {
 }
 
 func handleDelete(w http.ResponseWriter, r *http.Request, key string) {
-	filepath := filepath.Join("./cache-data", key)
+	filepath := filepath.Join("./cache-data", key+".gz")
 	err := os.Remove(filepath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -135,8 +168,52 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"keys":keys,
-		"count":len(keys),
+		"keys":  keys,
+		"count": len(keys),
 	})
 	log.Printf("LIST /cache/ - returned %d keys\n", len(keys))
+}
+
+func handleHashAndStore(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read body", http.StatusBadRequest)
+		log.Println("ERROR: Failed to read body:", err)
+		return
+	}
+
+	hash := sha256.Sum256(body)
+	hashString := hex.EncodeToString(hash[:])
+
+	cacheDir := "./cache-data"
+	_ = os.MkdirAll(cacheDir, 0755)
+
+	filepath := filepath.Join(cacheDir, hashString+".gz")
+	file, err := os.Create(filepath)
+	if err != nil {
+		http.Error(w, "failed to create file", http.StatusInternalServerError)
+		log.Println("ERROR: failed to create file:", err)
+		return
+	}
+
+	gzipWriter := gzip.NewWriter(file)
+	defer gzipWriter.Close()
+
+	bytesWritten, err := gzipWriter.Write(body)
+	if err != nil {
+		http.Error(w, "failed to write to file", http.StatusInternalServerError)
+		log.Println("Error: failed to write file:", err)
+		return
+	}
+	if err := saveMetadata(hashString, int64(bytesWritten)); err != nil {
+        log.Println("WARNING: Failed to save metadata:", err)
+    }
+
+	w.Header().Set("Content-Application", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"hash":    hashString,
+		"message": "File stored successfully",
+	})
+	log.Printf("POST /cache - stored with hash: %s (%d bytes)\n", hashString, bytesWritten)
 }
